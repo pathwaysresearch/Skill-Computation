@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/
+
+# Runtime / temp
+runtime/
+*.log
+*.tmp
+*.swp
+
+# Pipeline outputs (generated)
+output/
+output_*/
+output*/
+
+# Large local source files used for stress testing
+Merged_All_Sheets_*.csv
+Merged_All_Sheets_*.xlsx
+
+# Local sqlite artifacts
+*.db
+*.sqlite
+*.sqlite3
