@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from .config import PipelineConfig
+from .environment import assert_runtime_compatibility
 from .pipeline import run_pipeline
 
 
@@ -20,6 +21,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--similarity-method", choices=["unweighted", "weighted", "both"], default="both")
     parser.add_argument("--similarity-threshold", type=float, default=0.0)
     parser.add_argument("--projection-max-skill-degree", type=int, default=2_000)
+    parser.add_argument("--projection-max-pairs-per-skill", type=int, default=1_500_000)
+    parser.add_argument("--projection-max-total-pairs", type=int, default=25_000_000)
     parser.add_argument("--memory-warning-edge-threshold", type=int, default=1_000_000)
 
     parser.add_argument("--disable-betweenness", action="store_true")
@@ -38,6 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    assert_runtime_compatibility()
     parser = _build_parser()
     args = parser.parse_args()
 
@@ -49,6 +53,8 @@ def main() -> None:
         similarity_threshold=args.similarity_threshold,
         similarity_method=args.similarity_method,
         projection_max_skill_degree=args.projection_max_skill_degree,
+        projection_max_pairs_per_skill=args.projection_max_pairs_per_skill,
+        projection_max_total_pairs=args.projection_max_total_pairs,
         memory_warning_edge_threshold=args.memory_warning_edge_threshold,
         compute_betweenness_enabled=not args.disable_betweenness,
         compute_betweenness_max_vertices=args.compute_betweenness_max_vertices,

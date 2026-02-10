@@ -2,16 +2,24 @@ from __future__ import annotations
 
 import json
 import tempfile
-import time
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
 import altair as alt
 import pandas as pd
+import requests
 import streamlit as st
 
-from isb_igraph.config import PipelineConfig
+from isb_igraph.environment import assert_runtime_compatibility
+from isb_igraph.jobs_client import (
+    cancel_job,
+    default_api_base_url,
+    get_job,
+    get_job_events,
+    submit_job_from_path,
+    upload_and_submit_job,
+)
 from isb_igraph.lookup import (
     load_edges_for_explainability,
     load_jobs_catalog,
@@ -19,7 +27,6 @@ from isb_igraph.lookup import (
     lookup_closest_jobs,
     resolve_query_job,
 )
-from isb_igraph.pipeline import run_pipeline
 from isb_igraph.skill_lookup import (
     get_job_top_skills,
     load_edges_catalog,
@@ -42,13 +49,15 @@ from isb_igraph.visualization import (
 )
 
 
-st.set_page_config(page_title="ISB iGraph MVP", layout="wide")
-st.title("Job-to-Job Closeness MVP (igraph)")
-st.caption("Upload a job CSV, build Job-Skill bipartite graph, and export Job-Job similarity outputs.")
+assert_runtime_compatibility()
 
+st.set_page_config(page_title="ISB iGraph Deployment UI", layout="wide")
+st.title("ISB iGraph Deployment UI")
+st.caption("Async jobs API + worker for large-file graph computation, lookup, and visualization")
 
 COMPUTE_PRESETS: dict[str, dict[str, Any]] = {
-    "fast": {
+    "quick": {
+        "compute_profile": "quick",
         "compute_betweenness_enabled": False,
         "compute_betweenness_max_vertices": 5_000,
         "compute_betweenness_max_edges": 200_000,
@@ -56,7 +65,8 @@ COMPUTE_PRESETS: dict[str, dict[str, Any]] = {
         "compute_closeness_max_vertices": 12_000,
         "compute_closeness_max_edges": 500_000,
     },
-    "balanced": {
+    "standard": {
+        "compute_profile": "standard",
         "compute_betweenness_enabled": True,
         "compute_betweenness_max_vertices": 15_000,
         "compute_betweenness_max_edges": 1_000_000,
@@ -64,7 +74,8 @@ COMPUTE_PRESETS: dict[str, dict[str, Any]] = {
         "compute_closeness_max_vertices": 30_000,
         "compute_closeness_max_edges": 1_500_000,
     },
-    "deep": {
+    "full": {
+        "compute_profile": "full",
         "compute_betweenness_enabled": True,
         "compute_betweenness_max_vertices": 30_000,
         "compute_betweenness_max_edges": 2_000_000,
@@ -77,6 +88,27 @@ COMPUTE_PRESETS: dict[str, dict[str, Any]] = {
 
 def _load_csv_bytes(data: bytes) -> pd.DataFrame:
     return pd.read_csv(BytesIO(data))
+
+
+def _load_artifact_dataframes(job_payload: dict[str, Any]) -> None:
+    artifacts = job_payload.get("artifacts") or []
+    artifact_by_name = {str(a.get("artifact_name")): a for a in artifacts if isinstance(a, dict)}
+
+    def read_csv_artifact(name: str) -> pd.DataFrame | None:
+        item = artifact_by_name.get(name)
+        if not item:
+            return None
+        path = Path(str(item.get("file_path", "")))
+        if not path.exists() or not path.is_file():
+            return None
+        try:
+            return pd.read_csv(path)
+        except Exception:
+            return None
+
+    st.session_state["latest_nodes_df"] = read_csv_artifact("nodes")
+    st.session_state["latest_edges_df"] = read_csv_artifact("edges")
+    st.session_state["latest_similarity_df"] = read_csv_artifact("job_similarity_topk")
 
 
 def _render_subgraph_chart(plot_data: dict[str, Any]) -> None:
@@ -215,9 +247,7 @@ def _render_global_overview(
         st.altair_chart(comp_chart, use_container_width=True)
 
     st.markdown("### Full/Global Render")
-    st.caption(
-        "For very large graphs, full rendering is unsafe. Use global sampled render for an 'all-graph' view."
-    )
+    st.caption("For large graphs, render sampled global view instead of forcing full browser rendering.")
 
     col1, col2, col3 = st.columns(3)
     with col1:
@@ -246,39 +276,18 @@ def _render_global_overview(
             key="viz_global_max_edges",
         )
 
-    seed = st.number_input(
-        "Global sample seed",
-        min_value=1,
-        max_value=10_000_000,
-        value=42,
-        step=1,
-        key="viz_global_seed",
-    )
+    seed = st.number_input("Global sample seed", min_value=1, max_value=10_000_000, value=42, step=1)
 
     if render_mode == "Attempt full graph render":
         if graph.vcount() > 8000 or graph.ecount() > 60000:
-            st.warning(
-                "Graph too large for safe full render in browser. Falling back to sampled global view."
-            )
-            selected_nodes = sample_global_nodes(
-                graph,
-                max_nodes=int(global_max_nodes),
-                seed=int(seed),
-            )
+            st.warning("Graph too large for safe full render. Falling back to sampled view.")
+            selected_nodes = sample_global_nodes(graph, max_nodes=int(global_max_nodes), seed=int(seed))
         else:
             selected_nodes = list(range(graph.vcount()))
     else:
-        selected_nodes = sample_global_nodes(
-            graph,
-            max_nodes=int(global_max_nodes),
-            seed=int(seed),
-        )
+        selected_nodes = sample_global_nodes(graph, max_nodes=int(global_max_nodes), seed=int(seed))
 
-    plot_data = subgraph_to_plot_data(
-        graph,
-        selected_nodes,
-        max_edges=int(global_max_edges),
-    )
+    plot_data = subgraph_to_plot_data(graph, selected_nodes, max_edges=int(global_max_edges))
 
     cols = st.columns(3)
     cols[0].metric("Rendered Nodes", f"{len(plot_data['nodes']):,}")
@@ -304,109 +313,74 @@ def _render_global_overview(
             st.success("All diagnostics passed.")
 
 
-def _render_pipeline_sidebar() -> dict[str, Any]:
+def _render_sidebar() -> tuple[str, dict[str, Any]]:
     with st.sidebar:
-        st.header("Pipeline Settings")
-        similarity_method = st.selectbox("Similarity mode", ["both", "weighted", "unweighted"], index=0)
-        top_k = st.number_input("Top-K neighbors", min_value=1, max_value=200, value=20, step=1)
-        similarity_threshold = st.number_input(
-            "Similarity threshold",
-            min_value=0.0,
-            max_value=99999.0,
-            value=0.0,
-            step=0.1,
-        )
-        chunksize = st.number_input(
-            "Chunk size", min_value=1_000, max_value=200_000, value=25_000, step=1_000
-        )
-        projection_max_skill_degree = st.number_input(
-            "Projection max skill degree",
-            min_value=50,
-            max_value=50_000,
-            value=2_000,
-            step=50,
-        )
+        st.header("Execution")
+        api_base_url = st.text_input("Jobs API base URL", value=default_api_base_url())
 
         st.markdown("---")
-        st.header("Computation Controls")
-        compute_profile = st.selectbox(
-            "Computation profile",
-            ["fast", "balanced", "deep"],
-            index=1,
-            help="Fast skips heavy metrics; deep attempts larger centrality computations.",
+        st.header("Computation")
+        profile = st.selectbox("Compute profile", ["quick", "standard", "full"], index=1)
+        preset = COMPUTE_PRESETS[profile]
+
+        similarity_mode = st.selectbox("Similarity mode", ["both", "unweighted", "weighted"], index=0)
+        top_k = st.number_input("Top-K neighbors", min_value=1, max_value=200, value=20, step=1)
+        similarity_threshold = st.number_input("Similarity threshold", min_value=0.0, value=0.0, step=0.1)
+        chunksize = st.number_input("Chunk size", min_value=1_000, max_value=200_000, value=25_000, step=1_000)
+        projection_max_skill_degree = st.number_input(
+            "Projection max skill degree", min_value=50, max_value=50_000, value=2_000, step=50
         )
-        defaults = COMPUTE_PRESETS[compute_profile]
 
         with st.expander("Advanced metric options", expanded=False):
-            compute_betweenness_enabled = st.toggle(
-                "Compute betweenness",
-                value=bool(defaults["compute_betweenness_enabled"]),
-                key="sidebar_compute_betweenness_enabled",
-            )
+            compute_betweenness_enabled = st.toggle("Compute betweenness", value=preset["compute_betweenness_enabled"])
             compute_betweenness_max_vertices = st.number_input(
                 "Betweenness max vertices",
                 min_value=100,
                 max_value=500_000,
-                value=int(defaults["compute_betweenness_max_vertices"]),
+                value=int(preset["compute_betweenness_max_vertices"]),
                 step=100,
-                key="sidebar_compute_betweenness_max_vertices",
             )
             compute_betweenness_max_edges = st.number_input(
                 "Betweenness max edges",
                 min_value=1_000,
                 max_value=20_000_000,
-                value=int(defaults["compute_betweenness_max_edges"]),
+                value=int(preset["compute_betweenness_max_edges"]),
                 step=10_000,
-                key="sidebar_compute_betweenness_max_edges",
             )
 
-            compute_closeness_enabled = st.toggle(
-                "Compute closeness",
-                value=bool(defaults["compute_closeness_enabled"]),
-                key="sidebar_compute_closeness_enabled",
-            )
+            compute_closeness_enabled = st.toggle("Compute closeness", value=preset["compute_closeness_enabled"])
             compute_closeness_max_vertices = st.number_input(
                 "Closeness max vertices",
                 min_value=100,
                 max_value=500_000,
-                value=int(defaults["compute_closeness_max_vertices"]),
+                value=int(preset["compute_closeness_max_vertices"]),
                 step=100,
-                key="sidebar_compute_closeness_max_vertices",
             )
             compute_closeness_max_edges = st.number_input(
                 "Closeness max edges",
                 min_value=1_000,
                 max_value=20_000_000,
-                value=int(defaults["compute_closeness_max_edges"]),
+                value=int(preset["compute_closeness_max_edges"]),
                 step=10_000,
-                key="sidebar_compute_closeness_max_edges",
             )
 
         st.markdown("---")
+        st.header("Subset")
         subset_mode = st.toggle("Subset mode", value=False)
-        subset_target_rows = st.number_input(
-            "Subset target rows (0 to disable)",
-            min_value=0,
-            max_value=2_000_000,
-            value=0,
-            step=1_000,
-        )
-        subset_target_size_mb = st.number_input(
-            "Subset target size MB",
-            min_value=10,
-            max_value=2_000,
-            value=100,
-            step=10,
-        )
-        subset_seed = st.number_input("Subset seed", min_value=1, max_value=10_000_000, value=42, step=1)
+        subset_target_rows = st.number_input("Subset target rows (0 to disable)", min_value=0, value=0, step=1_000)
+        subset_target_size_mb = st.number_input("Subset target size MB", min_value=10, value=100, step=10)
+        subset_seed = st.number_input("Subset seed", min_value=1, value=42, step=1)
 
-    return {
-        "similarity_method": similarity_method,
+    options = {
+        "compute_profile": profile,
+        "similarity_method": similarity_mode,
+        "similarity_mode": similarity_mode,
         "top_k": int(top_k),
         "similarity_threshold": float(similarity_threshold),
         "chunksize": int(chunksize),
         "projection_max_skill_degree": int(projection_max_skill_degree),
-        "compute_profile": compute_profile,
+        "projection_max_pairs_per_skill": (1_000_000 if profile == "quick" else (1_500_000 if profile == "standard" else 3_000_000)),
+        "projection_max_total_pairs": (8_000_000 if profile == "quick" else (25_000_000 if profile == "standard" else 70_000_000)),
         "compute_betweenness_enabled": bool(compute_betweenness_enabled),
         "compute_betweenness_max_vertices": int(compute_betweenness_max_vertices),
         "compute_betweenness_max_edges": int(compute_betweenness_max_edges),
@@ -414,185 +388,241 @@ def _render_pipeline_sidebar() -> dict[str, Any]:
         "compute_closeness_max_vertices": int(compute_closeness_max_vertices),
         "compute_closeness_max_edges": int(compute_closeness_max_edges),
         "subset_mode": bool(subset_mode),
-        "subset_target_rows": (int(subset_target_rows) if int(subset_target_rows) > 0 else None),
+        "subset_target_rows": int(subset_target_rows) if int(subset_target_rows) > 0 else None,
         "subset_target_size_mb": int(subset_target_size_mb),
         "subset_seed": int(subset_seed),
+        "seed": int(subset_seed),
     }
+    return api_base_url, options
 
 
-def _render_lookup_tab() -> None:
-    st.subheader("Deterministic Lookup")
-    st.caption(
-        "Shared-skill based ranking only. Default job closeness is unweighted shared-skill count, not random."
-    )
+def _run_tab(api_base_url: str, options: dict[str, Any]) -> None:
+    st.subheader("Run (Async Jobs)")
+    st.caption("Submit jobs to API/worker. Streamlit does not run heavy compute in-process.")
 
-    source_mode = st.radio(
-        "Lookup source",
-        ["Latest pipeline run", "Upload exported files"],
-        horizontal=True,
-        key="lookup_source_mode",
-    )
+    mode = st.radio("Input mode", ["Server file path", "Upload file"], horizontal=True)
+    submit_col1, submit_col2 = st.columns(2)
+
+    with submit_col1:
+        if mode == "Server file path":
+            input_path = st.text_input(
+                "Server input path",
+                value="/Users/srijan26/ISB_Work/isb-igraph /Merged_All_Sheets_post6_skill_salary_merged_skills_non_empty_2_from_xlsx.csv",
+            )
+            if st.button("Submit path job", type="primary"):
+                try:
+                    payload = submit_job_from_path(
+                        input_path=Path(input_path),
+                        options=options,
+                        base_url=api_base_url,
+                    )
+                except Exception as exc:
+                    st.error(f"Failed to submit job: {exc}")
+                else:
+                    st.session_state["latest_job_id"] = payload.get("job_id")
+                    st.session_state["latest_job_payload"] = payload
+                    st.success(f"Submitted job: {payload.get('job_id')}")
+        else:
+            uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"]) 
+            part_size_mb = st.number_input("Upload chunk size MB", min_value=2, max_value=128, value=8, step=2)
+            if st.button("Upload + submit job", type="primary"):
+                if uploaded is None:
+                    st.error("Upload a file first.")
+                else:
+                    with tempfile.TemporaryDirectory(prefix="isb_upload_") as tmp_dir:
+                        tmp_path = Path(tmp_dir) / uploaded.name
+                        tmp_path.write_bytes(uploaded.getvalue())
+                        try:
+                            payload = upload_and_submit_job(
+                                file_path=tmp_path,
+                                options=options,
+                                base_url=api_base_url,
+                                part_size_mb=int(part_size_mb),
+                            )
+                        except Exception as exc:
+                            st.error(f"Upload/submit failed: {exc}")
+                        else:
+                            st.session_state["latest_job_id"] = payload.get("job_id")
+                            st.session_state["latest_job_payload"] = payload
+                            st.success(f"Submitted job: {payload.get('job_id')}")
+
+    with submit_col2:
+        job_id = st.text_input("Track job ID", value=st.session_state.get("latest_job_id", ""))
+        c1, c2, c3 = st.columns(3)
+        if c1.button("Refresh status"):
+            if not job_id.strip():
+                st.error("Enter job_id")
+            else:
+                try:
+                    payload = get_job(job_id.strip(), base_url=api_base_url)
+                    st.session_state["latest_job_payload"] = payload
+                    st.session_state["latest_job_id"] = payload.get("job_id")
+                    if payload.get("status") == "completed":
+                        _load_artifact_dataframes(payload)
+                except Exception as exc:
+                    st.error(f"Failed to fetch job: {exc}")
+        if c2.button("Load events") and job_id.strip():
+            try:
+                events_payload = get_job_events(job_id.strip(), base_url=api_base_url, limit=300)
+                st.session_state["latest_job_events"] = events_payload.get("events", [])
+            except Exception as exc:
+                st.error(f"Failed to fetch events: {exc}")
+        if c3.button("Cancel job") and job_id.strip():
+            try:
+                _ = cancel_job(job_id.strip(), base_url=api_base_url)
+                st.warning("Cancel requested.")
+            except Exception as exc:
+                st.error(f"Failed to cancel job: {exc}")
+
+    latest_job = st.session_state.get("latest_job_payload")
+    if latest_job:
+        st.markdown("### Latest Job")
+        status = str(latest_job.get("status", "unknown"))
+        progress = float(latest_job.get("progress", 0.0) or 0.0)
+        st.progress(max(0.0, min(1.0, progress)))
+        st.write({
+            "job_id": latest_job.get("job_id"),
+            "status": status,
+            "stage": latest_job.get("stage"),
+            "progress": progress,
+            "error_message": latest_job.get("error_message"),
+            "output_dir": latest_job.get("output_dir"),
+        })
+
+        artifacts = latest_job.get("artifacts") or []
+        if artifacts:
+            st.markdown("### Artifacts")
+            for a in artifacts:
+                file_path = Path(str(a.get("file_path", "")))
+                if file_path.exists() and file_path.is_file():
+                    st.download_button(
+                        label=f"Download {a.get('artifact_name')} ({file_path.name})",
+                        data=file_path.read_bytes(),
+                        file_name=file_path.name,
+                        key=f"artifact_dl_{latest_job.get('job_id')}_{a.get('artifact_name')}",
+                    )
+
+    events = st.session_state.get("latest_job_events") or []
+    if events:
+        st.markdown("### Recent Events")
+        st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+
+
+def _metrics_tab() -> None:
+    st.subheader("Metrics")
+    latest_job = st.session_state.get("latest_job_payload")
+    if not latest_job:
+        st.info("No job loaded yet. Submit and refresh a job first.")
+        return
+
+    run_metadata = latest_job.get("run_metadata")
+    if not run_metadata:
+        st.warning("Run metadata not available yet. Job may still be running.")
+        return
+
+    st.markdown("### Graph Summary")
+    st.json(run_metadata.get("graph_summary", {}))
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("### Validation Report")
+        st.json(run_metadata.get("validation_report", {}))
+    with col2:
+        st.markdown("### QA Report")
+        st.json(run_metadata.get("qa_report", {}))
+
+    profile_records = run_metadata.get("profile_records") or []
+    if profile_records:
+        st.markdown("### Profiling")
+        st.dataframe(pd.DataFrame(profile_records), use_container_width=True, hide_index=True)
+
+
+def _lookup_tab() -> None:
+    st.subheader("Lookup")
+    st.caption("Deterministic shared-skill based lookup.")
+
+    source_mode = st.radio("Lookup source", ["Latest completed job", "Upload exported files"], horizontal=True)
 
     nodes_df: pd.DataFrame | None = None
     edges_df: pd.DataFrame | None = None
     sim_df: pd.DataFrame | None = None
 
-    if source_mode == "Latest pipeline run":
+    if source_mode == "Latest completed job":
         nodes_df = st.session_state.get("latest_nodes_df")
         edges_df = st.session_state.get("latest_edges_df")
         sim_df = st.session_state.get("latest_similarity_df")
-
         if nodes_df is None or edges_df is None:
-            st.info("Run the pipeline first, or switch to upload mode.")
+            st.info("No latest artifacts loaded. Refresh a completed job first.")
+            return
     else:
         upload_nodes = st.file_uploader("Upload nodes.csv", type=["csv"], key="lookup_nodes_upload")
         upload_edges = st.file_uploader("Upload edges.csv", type=["csv"], key="lookup_edges_upload")
-        upload_similarity = st.file_uploader(
-            "Upload job_similarity_topk.csv (optional for Job -> Closest Jobs)",
-            type=["csv"],
-            key="lookup_similarity_upload",
-        )
-
-        if upload_nodes is not None and upload_edges is not None:
-            nodes_df = _load_csv_bytes(upload_nodes.getvalue())
-            edges_df = _load_csv_bytes(upload_edges.getvalue())
+        upload_similarity = st.file_uploader("Upload job_similarity_topk.csv", type=["csv"], key="lookup_sim_upload")
+        if upload_nodes is None or upload_edges is None:
+            st.info("Upload nodes.csv and edges.csv.")
+            return
+        nodes_df = _load_csv_bytes(upload_nodes.getvalue())
+        edges_df = _load_csv_bytes(upload_edges.getvalue())
         if upload_similarity is not None:
             sim_df = _load_csv_bytes(upload_similarity.getvalue())
 
-        if nodes_df is None or edges_df is None:
-            st.info("Upload nodes.csv and edges.csv to use lookup tools.")
+    jobs_catalog = load_jobs_catalog(nodes_df)
+    skills_catalog = load_skills_catalog(nodes_df)
+    edges_catalog = load_edges_catalog(edges_df)
+    edges_explain = load_edges_for_explainability(edges_df)
 
-    if nodes_df is None or edges_df is None:
-        return
+    tab_a, tab_b, tab_c = st.tabs(["Job -> Closest Jobs", "Skill(s) -> Closest Jobs", "Job -> Top Skills"])
 
-    try:
-        jobs_catalog = load_jobs_catalog(nodes_df)
-        skills_catalog = load_skills_catalog(nodes_df)
-        edges_catalog = load_edges_catalog(edges_df)
-        edges_explain = load_edges_for_explainability(edges_df)
-    except Exception as exc:
-        st.error(f"Failed to prepare lookup catalogs: {exc}")
-        return
-
-    st.write(
-        f"Lookup catalogs loaded: **{len(jobs_catalog):,} jobs**, **{len(skills_catalog):,} skills**, "
-        f"**{len(edges_catalog):,} job-skill edges**"
-    )
-
-    lookup_job_tab, lookup_skill_tab, lookup_top_skills_tab = st.tabs(
-        ["Job -> Closest Jobs", "Skill(s) -> Closest Jobs", "Job -> Top Skills"]
-    )
-
-    with lookup_job_tab:
+    with tab_a:
         if sim_df is None:
-            st.info("Upload job_similarity_topk.csv or run pipeline to use this panel.")
+            st.info("Similarity file not available.")
         else:
-            try:
-                similarity_catalog = load_similarity(sim_df)
-            except Exception as exc:
-                st.error(f"Failed to parse similarity data: {exc}")
-            else:
-                col1, col2, col3 = st.columns(3)
-                with col1:
-                    method = st.selectbox(
-                        "Method",
-                        ["unweighted", "weighted", "all"],
-                        index=0,
-                        key="lookup_job_method",
+            similarity_catalog = load_similarity(sim_df)
+            method = st.selectbox("Method", ["unweighted", "weighted", "all"], index=0)
+            limit = st.number_input("Limit", min_value=1, max_value=200, value=20, step=1)
+            include_explainability = st.toggle("Include shared skill explainability", value=True)
+            q1, q2 = st.columns(2)
+            with q1:
+                job_id_query = st.text_input("Job ID", key="lookup_job_id")
+            with q2:
+                title_query = st.text_input("Job title", key="lookup_job_title")
+
+            if st.button("Run job lookup"):
+                resolved_job_id, candidates_df, reason = resolve_query_job(
+                    jobs_catalog,
+                    job_id=job_id_query or None,
+                    title_query=title_query or None,
+                    max_candidates=20,
+                )
+                if resolved_job_id is None:
+                    st.warning(f"Query not uniquely resolved ({reason}).")
+                    if not candidates_df.empty:
+                        st.dataframe(candidates_df, use_container_width=True, hide_index=True)
+                else:
+                    out = lookup_closest_jobs(
+                        similarity_df=similarity_catalog,
+                        jobs_df=jobs_catalog,
+                        query_job_id=resolved_job_id,
+                        method=str(method),
+                        limit=int(limit),
+                        edges_df=edges_explain if include_explainability else None,
                     )
-                with col2:
-                    limit = st.number_input(
-                        "Neighbors per job",
-                        min_value=1,
-                        max_value=200,
-                        value=20,
-                        step=1,
-                        key="lookup_job_limit",
-                    )
-                with col3:
-                    include_explainability = st.toggle(
-                        "Include shared-skill explainability",
-                        value=True,
-                        key="lookup_job_explain",
-                    )
+                    st.success(f"Resolved job_id: {resolved_job_id}")
+                    st.dataframe(out, use_container_width=True, hide_index=True)
 
-                jcol1, jcol2 = st.columns(2)
-                with jcol1:
-                    job_id_query = st.text_input("Job ID", key="lookup_job_id")
-                with jcol2:
-                    title_query = st.text_input("Job title", key="lookup_job_title")
+    with tab_b:
+        limit = st.number_input("Top jobs", min_value=1, max_value=500, value=20, step=1)
+        fuzzy_cutoff = st.slider("Fuzzy cutoff", min_value=0, max_value=100, value=85, step=1)
+        suggestion_limit = st.number_input("Suggestion limit", min_value=1, max_value=20, value=5)
+        skills_input = st.text_area("Skills (comma-separated)", placeholder="problem solving, analytical thinking")
 
-                if st.button("Find closest jobs", key="lookup_job_run"):
-                    resolved_job_id, candidates_df, reason = resolve_query_job(
-                        jobs_catalog,
-                        job_id=job_id_query or None,
-                        title_query=title_query or None,
-                        max_candidates=15,
-                    )
-                    if resolved_job_id is None:
-                        if not candidates_df.empty:
-                            st.warning(f"Query not uniquely resolved ({reason}). Pick a job_id from candidates.")
-                            st.dataframe(candidates_df, use_container_width=True, hide_index=True)
-                        else:
-                            st.error(f"Query not resolved ({reason}).")
-                    else:
-                        closest_df = lookup_closest_jobs(
-                            similarity_df=similarity_catalog,
-                            jobs_df=jobs_catalog,
-                            query_job_id=resolved_job_id,
-                            method=method,
-                            limit=int(limit),
-                            edges_df=(edges_explain if include_explainability else None),
-                        )
-                        st.success(f"Resolved job_id: {resolved_job_id}")
-                        if closest_df.empty:
-                            st.info("No neighbors found.")
-                        else:
-                            st.dataframe(closest_df, use_container_width=True, hide_index=True)
-
-    with lookup_skill_tab:
-        scol1, scol2, scol3 = st.columns(3)
-        with scol1:
-            skill_limit = st.number_input(
-                "Top jobs",
-                min_value=1,
-                max_value=500,
-                value=20,
-                step=1,
-                key="lookup_skill_limit",
-            )
-        with scol2:
-            fuzzy_cutoff = st.slider(
-                "Fuzzy cutoff",
-                min_value=0,
-                max_value=100,
-                value=85,
-                step=1,
-                key="lookup_skill_cutoff",
-            )
-        with scol3:
-            suggestion_limit = st.number_input(
-                "Suggestions per unresolved skill",
-                min_value=1,
-                max_value=20,
-                value=5,
-                step=1,
-                key="lookup_skill_sugg_limit",
-            )
-
-        skill_query_text = st.text_area(
-            "Skill query (comma-separated)",
-            placeholder="problem solving, analytical thinking, machine operation",
-            key="lookup_skill_query",
-        )
-
-        if st.button("Find jobs for skills", key="lookup_skill_run"):
-            query_skills = parse_skill_query(skill_query_text)
-            if not query_skills:
-                st.error("Provide at least one skill.")
+        if st.button("Run skill->job lookup"):
+            queries = parse_skill_query(skills_input)
+            if not queries:
+                st.error("Enter at least one skill")
             else:
                 resolution = resolve_skills(
-                    query_skills,
+                    queries,
                     skills_catalog,
                     fuzzy_cutoff=int(fuzzy_cutoff),
                     suggestion_limit=int(suggestion_limit),
@@ -601,358 +631,152 @@ def _render_lookup_tab() -> None:
                 unresolved_df = resolution["unresolved_skills"]
                 suggestions = resolution["suggestions"]
 
-                st.subheader("Resolved Skills")
-                if resolved_df.empty:
-                    st.warning("No skills resolved from query.")
-                else:
-                    st.dataframe(
-                        resolved_df[["query", "label", "skill_text_normalized", "skill_id"]],
-                        use_container_width=True,
-                        hide_index=True,
-                    )
+                st.markdown("### Resolved")
+                st.dataframe(resolved_df, use_container_width=True, hide_index=True)
 
                 if not unresolved_df.empty:
-                    st.subheader("Unresolved Skills")
+                    st.markdown("### Unresolved")
                     st.dataframe(unresolved_df, use_container_width=True, hide_index=True)
-                    suggestion_rows: list[dict[str, Any]] = []
-                    for query_text, options in suggestions.items():
-                        suggestion_rows.append(
-                            {
-                                "query": query_text,
-                                "suggestions": ", ".join(options) if options else "none",
-                            }
-                        )
-                    if suggestion_rows:
-                        st.subheader("Suggestions")
-                        st.dataframe(pd.DataFrame(suggestion_rows), use_container_width=True, hide_index=True)
+                    rows = [{"query": q, "suggestions": ", ".join(vals) if vals else "none"} for q, vals in suggestions.items()]
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
                 if not resolved_df.empty:
-                    ranked_df = rank_jobs_for_skills_or(
+                    ranked = rank_jobs_for_skills_or(
                         edges_df=edges_catalog,
                         jobs_df=jobs_catalog,
                         resolved_skill_ids=resolved_df["skill_id"].astype(str).tolist(),
-                        total_query_skills=len(query_skills),
-                        limit=int(skill_limit),
+                        total_query_skills=len(queries),
+                        limit=int(limit),
                     )
-                    st.subheader("Closest Jobs by Skill OR")
-                    if ranked_df.empty:
-                        st.info("No jobs matched the resolved skills.")
-                    else:
-                        st.dataframe(ranked_df, use_container_width=True, hide_index=True)
+                    st.markdown("### Ranked Jobs")
+                    st.dataframe(ranked, use_container_width=True, hide_index=True)
 
-    with lookup_top_skills_tab:
-        tcol1, tcol2 = st.columns(2)
-        with tcol1:
-            top_job_id_query = st.text_input("Job ID", key="lookup_top_skills_job_id")
-        with tcol2:
-            top_title_query = st.text_input("Job title", key="lookup_top_skills_title")
+    with tab_c:
+        q1, q2 = st.columns(2)
+        with q1:
+            job_id_query = st.text_input("Job ID", key="top_skills_job_id")
+        with q2:
+            title_query = st.text_input("Job title", key="top_skills_title")
+        limit = st.number_input("Top skills", min_value=1, max_value=200, value=20, step=1)
 
-        top_limit = st.number_input(
-            "Top skills",
-            min_value=1,
-            max_value=200,
-            value=20,
-            step=1,
-            key="lookup_top_skills_limit",
-        )
-
-        if st.button("Show top skills for job", key="lookup_top_skills_run"):
+        if st.button("Run job->skills lookup"):
             resolved_job_id, candidates_df, reason = resolve_query_job(
                 jobs_catalog,
-                job_id=top_job_id_query or None,
-                title_query=top_title_query or None,
-                max_candidates=15,
+                job_id=job_id_query or None,
+                title_query=title_query or None,
+                max_candidates=20,
             )
             if resolved_job_id is None:
+                st.warning(f"Query not resolved ({reason})")
                 if not candidates_df.empty:
-                    st.warning(f"Query not uniquely resolved ({reason}). Pick a job_id from candidates.")
                     st.dataframe(candidates_df, use_container_width=True, hide_index=True)
-                else:
-                    st.error(f"Query not resolved ({reason}).")
             else:
-                top_skills_df = get_job_top_skills(
+                out = get_job_top_skills(
                     edges_df=edges_catalog,
                     skills_df=skills_catalog,
                     jobs_df=jobs_catalog,
                     query_job_id=resolved_job_id,
-                    limit=int(top_limit),
+                    limit=int(limit),
                 )
-                st.success(f"Resolved job_id: {resolved_job_id}")
-                if top_skills_df.empty:
-                    st.info("No skills found for this job.")
-                else:
-                    st.dataframe(top_skills_df, use_container_width=True, hide_index=True)
+                st.dataframe(out, use_container_width=True, hide_index=True)
 
 
-settings = _render_pipeline_sidebar()
-
-tab_pipeline, tab_visualizer, tab_lookup = st.tabs(["Pipeline", "Subgraph Visualizer", "Lookup"])
-
-with tab_pipeline:
-    uploaded = st.file_uploader("Upload CSV", type=["csv"], key="pipeline_csv_upload")
-    run_clicked = st.button("Run Pipeline", type="primary", key="run_pipeline_btn")
-
-    if run_clicked:
-        if uploaded is None:
-            st.error("Upload a CSV file first.")
-        else:
-            run_dir = Path(tempfile.mkdtemp(prefix="isb_igraph_run_"))
-            input_path = run_dir / uploaded.name
-            input_path.write_bytes(uploaded.getvalue())
-
-            output_dir = run_dir / "outputs"
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            config = PipelineConfig(
-                input_csv=input_path,
-                output_dir=output_dir,
-                chunksize=settings["chunksize"],
-                top_k=settings["top_k"],
-                similarity_threshold=settings["similarity_threshold"],
-                similarity_method=settings["similarity_method"],
-                projection_max_skill_degree=settings["projection_max_skill_degree"],
-                compute_betweenness_enabled=settings["compute_betweenness_enabled"],
-                compute_betweenness_max_vertices=settings["compute_betweenness_max_vertices"],
-                compute_betweenness_max_edges=settings["compute_betweenness_max_edges"],
-                compute_closeness_enabled=settings["compute_closeness_enabled"],
-                compute_closeness_max_vertices=settings["compute_closeness_max_vertices"],
-                compute_closeness_max_edges=settings["compute_closeness_max_edges"],
-                subset_mode=settings["subset_mode"],
-                subset_target_rows=settings["subset_target_rows"],
-                subset_target_size_mb=settings["subset_target_size_mb"],
-                subset_seed=settings["subset_seed"],
-            )
-
-            progress = st.progress(0)
-            status = st.empty()
-            logs = st.empty()
-            progress_lines: list[str] = []
-
-            def update_progress(message: str, fraction: float) -> None:
-                progress.progress(max(0.0, min(1.0, fraction)))
-                status.write(message)
-                progress_lines.append(f"[{time.strftime('%H:%M:%S')}] {message}")
-                logs.code("\n".join(progress_lines[-10:]))
-
-            try:
-                result = run_pipeline(config, progress_fn=update_progress)
-            except Exception as exc:
-                st.error(f"Pipeline failed: {exc}")
-                st.stop()
-
-            downloads: dict[str, tuple[str, bytes]] = {}
-            for _, file_path in result.output_files.items():
-                if file_path.exists():
-                    downloads[file_path.name] = ("application/octet-stream", file_path.read_bytes())
-
-            latest_nodes_path = result.output_files.get("nodes")
-            latest_edges_path = result.output_files.get("edges")
-            latest_similarity_path = result.output_files.get("job_similarity_topk")
-
-            latest_nodes_df = pd.read_csv(latest_nodes_path) if latest_nodes_path and latest_nodes_path.exists() else None
-            latest_edges_df = pd.read_csv(latest_edges_path) if latest_edges_path and latest_edges_path.exists() else None
-            latest_similarity_df = (
-                pd.read_csv(latest_similarity_path)
-                if latest_similarity_path and latest_similarity_path.exists()
-                else None
-            )
-
-            st.session_state["latest_result"] = {
-                "graph_summary": result.graph_summary,
-                "validation_report": result.validation_report,
-                "qa_report": result.qa_report,
-                "profile_records": result.profile_records,
-                "output_dir": str(result.output_dir),
-                "output_files": {k: str(v) for k, v in result.output_files.items()},
-                "downloads": downloads,
-                "compute_profile": settings["compute_profile"],
-            }
-            st.session_state["latest_nodes_df"] = latest_nodes_df
-            st.session_state["latest_edges_df"] = latest_edges_df
-            st.session_state["latest_similarity_df"] = latest_similarity_df
-
-    latest_result = st.session_state.get("latest_result")
-    if latest_result:
-        st.success("Pipeline completed successfully")
-        st.subheader("Graph Summary")
-        st.json(latest_result["graph_summary"])
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Validation")
-            st.json(latest_result["validation_report"])
-        with col2:
-            st.subheader("QA Checks")
-            st.json(latest_result["qa_report"])
-
-        st.subheader("Downloads")
-        for file_name, (mime, data) in latest_result["downloads"].items():
-            st.download_button(
-                label=f"Download {file_name}",
-                data=data,
-                file_name=file_name,
-                mime=mime,
-                key=f"download_{file_name}",
-            )
-
-        st.subheader("Profiling")
-        st.table(latest_result["profile_records"])
-
-        st.subheader("Run Metadata")
-        st.code(
-            json.dumps(
-                {
-                    "output_dir": latest_result["output_dir"],
-                    "files": list(latest_result["output_files"].values()),
-                    "compute_profile": latest_result.get("compute_profile", "balanced"),
-                },
-                indent=2,
-            )
-        )
-    else:
-        st.info("Upload a CSV and run pipeline to generate outputs.")
-
-with tab_visualizer:
-    st.subheader("Interactive Subgraph Visualizer")
-    st.caption(
-        "Visualize graph slices, components, or global overview. Full graph rendering is constrained for stability."
-    )
-
-    source_mode = st.radio(
-        "Graph source",
-        ["Latest pipeline run", "Upload nodes.csv + edges.csv"],
-        horizontal=True,
-    )
+def _visualize_tab() -> None:
+    st.subheader("Visualize")
+    source_mode = st.radio("Graph source", ["Latest completed job", "Upload nodes + edges"], horizontal=True)
 
     nodes_df: pd.DataFrame | None = None
     edges_df: pd.DataFrame | None = None
 
-    if source_mode == "Latest pipeline run":
+    if source_mode == "Latest completed job":
         nodes_df = st.session_state.get("latest_nodes_df")
         edges_df = st.session_state.get("latest_edges_df")
         if nodes_df is None or edges_df is None:
-            st.info("Run the pipeline first, or switch to upload mode.")
+            st.info("No latest artifacts loaded. Refresh a completed job first.")
+            return
     else:
         upload_nodes = st.file_uploader("Upload nodes.csv", type=["csv"], key="viz_nodes_upload")
         upload_edges = st.file_uploader("Upload edges.csv", type=["csv"], key="viz_edges_upload")
-        if upload_nodes and upload_edges:
-            nodes_df = _load_csv_bytes(upload_nodes.getvalue())
-            edges_df = _load_csv_bytes(upload_edges.getvalue())
-        else:
-            st.info("Upload both nodes.csv and edges.csv to visualize.")
+        if not upload_nodes or not upload_edges:
+            st.info("Upload nodes.csv and edges.csv")
+            return
+        nodes_df = _load_csv_bytes(upload_nodes.getvalue())
+        edges_df = _load_csv_bytes(upload_edges.getvalue())
 
-    if nodes_df is not None and edges_df is not None:
-        try:
-            export_graph = build_graph_from_exports(nodes_df=nodes_df, edges_df=edges_df)
-        except Exception as exc:
-            st.error(f"Failed to build graph from exports: {exc}")
-        else:
-            graph = export_graph.graph
-            st.write(
-                f"Graph loaded: **{graph.vcount():,}** nodes, **{graph.ecount():,}** edges"
-            )
-            if graph.vcount() > 200_000 or graph.ecount() > 1_000_000:
-                st.warning(
-                    "Very large graph detected. Prefer global sampled view or lower render caps."
-                )
+    export_graph = build_graph_from_exports(nodes_df=nodes_df, edges_df=edges_df)
+    graph = export_graph.graph
+    st.write(f"Graph loaded: **{graph.vcount():,}** nodes, **{graph.ecount():,}** edges")
 
-            max_nodes = st.slider("Max nodes in rendered subgraph", min_value=20, max_value=5000, value=300, step=10)
-            max_edges = st.slider("Max edges in rendered subgraph", min_value=50, max_value=15000, value=1500, step=50)
+    max_nodes = st.slider("Max nodes in rendered subgraph", min_value=20, max_value=5000, value=300, step=10)
+    max_edges = st.slider("Max edges in rendered subgraph", min_value=50, max_value=15000, value=1500, step=50)
 
-            viz_mode = st.radio(
-                "Visualization mode",
-                ["Ego graph", "Top connected component", "Global overview"],
-                horizontal=True,
-            )
+    mode = st.radio("Visualization mode", ["Ego graph", "Top connected component", "Global overview"], horizontal=True)
 
-            if viz_mode == "Ego graph":
-                col1, col2 = st.columns(2)
-                with col1:
-                    job_id_query = st.text_input("Job ID filter (optional)")
-                with col2:
-                    title_query = st.text_input("Job title filter (optional)")
+    if mode == "Ego graph":
+        c1, c2 = st.columns(2)
+        with c1:
+            job_id_query = st.text_input("Job ID filter")
+        with c2:
+            title_query = st.text_input("Job title filter")
 
-                candidate_df = find_job_matches(
-                    nodes_df,
-                    job_id_query=job_id_query or None,
-                    title_query=title_query or None,
-                    limit=200,
-                )
-                if candidate_df.empty:
-                    st.warning("No matching job nodes found with current filters.")
-                else:
-                    options = [f"{row.node_id} | {row.label}" for row in candidate_df.itertuples(index=False)]
-                    selected = st.selectbox("Select center job", options)
-                    selected_job_id = selected.split(" | ", 1)[0]
-                    hops = st.slider("Neighborhood hops", min_value=1, max_value=4, value=2, step=1)
+        candidates = find_job_matches(nodes_df, job_id_query=job_id_query or None, title_query=title_query or None, limit=200)
+        if candidates.empty:
+            st.warning("No matching jobs found.")
+            return
 
-                    center_idx = export_graph.node_index.get(selected_job_id)
-                    if center_idx is None:
-                        st.error("Selected job not found in graph index.")
-                    else:
-                        sub_nodes = bfs_ego_nodes(
-                            graph,
-                            center_idx,
-                            max_hops=int(hops),
-                            max_nodes=int(max_nodes),
-                        )
-                        plot_data = subgraph_to_plot_data(
-                            graph,
-                            sub_nodes,
-                            max_edges=int(max_edges),
-                        )
+        options = [f"{row.node_id} | {row.label}" for row in candidates.itertuples(index=False)]
+        selected = st.selectbox("Center job", options)
+        selected_job_id = selected.split(" | ", 1)[0]
+        hops = st.slider("Neighborhood hops", min_value=1, max_value=4, value=2)
 
-                        cols = st.columns(3)
-                        cols[0].metric("Rendered Nodes", f"{len(plot_data['nodes']):,}")
-                        cols[1].metric("Rendered Edges", f"{len(plot_data['edges']):,}")
-                        cols[2].metric("Clipped Edges", f"{int(plot_data['clipped_edges']):,}")
+        center_idx = export_graph.node_index.get(selected_job_id)
+        if center_idx is None:
+            st.error("Selected job not found in graph index")
+            return
 
-                        _render_subgraph_chart(plot_data)
+        sub_nodes = bfs_ego_nodes(graph, center_idx, max_hops=int(hops), max_nodes=int(max_nodes))
+        plot_data = subgraph_to_plot_data(graph, sub_nodes, max_edges=int(max_edges))
+        _render_subgraph_chart(plot_data)
 
-                        st.subheader("Candidate Job Nodes")
-                        st.dataframe(
-                            candidate_df[["node_id", "label"]].rename(
-                                columns={"node_id": "job_id", "label": "job_title"}
-                            ),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
+    elif mode == "Top connected component":
+        comps = top_components(graph, limit=50)
+        if not comps:
+            st.warning("No components available")
+            return
+        labels = [f"Component {idx} (size={size:,})" for idx, size in comps]
+        selected_label = st.selectbox("Component", labels)
+        comp_idx = int(selected_label.split(" ")[1])
+        sub_nodes = component_nodes(graph, component_index=comp_idx, max_nodes=int(max_nodes))
+        plot_data = subgraph_to_plot_data(graph, sub_nodes, max_edges=int(max_edges))
+        _render_subgraph_chart(plot_data)
 
-            elif viz_mode == "Top connected component":
-                component_list = top_components(graph, limit=50)
-                if not component_list:
-                    st.warning("No components available in graph.")
-                else:
-                    labels = [f"Component {idx} (size={size:,})" for idx, size in component_list]
-                    selected_label = st.selectbox("Select component", labels)
-                    comp_idx = int(selected_label.split(" ")[1])
+    else:
+        _render_global_overview(
+            graph,
+            nodes_df=nodes_df,
+            edges_df=edges_df,
+            default_max_nodes=min(1200, int(max_nodes)),
+            default_max_edges=min(4000, int(max_edges)),
+        )
 
-                    sub_nodes = component_nodes(
-                        graph,
-                        component_index=comp_idx,
-                        max_nodes=int(max_nodes),
-                    )
-                    plot_data = subgraph_to_plot_data(
-                        graph,
-                        sub_nodes,
-                        max_edges=int(max_edges),
-                    )
 
-                    cols = st.columns(3)
-                    cols[0].metric("Rendered Nodes", f"{len(plot_data['nodes']):,}")
-                    cols[1].metric("Rendered Edges", f"{len(plot_data['edges']):,}")
-                    cols[2].metric("Clipped Edges", f"{int(plot_data['clipped_edges']):,}")
+api_base_url, options = _render_sidebar()
 
-                    _render_subgraph_chart(plot_data)
+tab_run, tab_metrics, tab_lookup, tab_visualize = st.tabs(["Run", "Metrics", "Lookup", "Visualize"])
 
-            else:
-                _render_global_overview(
-                    graph,
-                    nodes_df=nodes_df,
-                    edges_df=edges_df,
-                    default_max_nodes=min(1200, int(max_nodes)),
-                    default_max_edges=min(4000, int(max_edges)),
-                )
+with tab_run:
+    _run_tab(api_base_url, options)
+
+with tab_metrics:
+    _metrics_tab()
 
 with tab_lookup:
-    _render_lookup_tab()
+    _lookup_tab()
+
+with tab_visualize:
+    _visualize_tab()
+
+st.markdown("---")
+st.caption(
+    "Deployment mode: API + worker. For huge files, use 'Server file path' submit and keep UI focused on monitoring/results."
+)

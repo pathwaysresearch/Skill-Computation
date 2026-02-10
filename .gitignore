@@ -30,3 +30,6 @@ Merged_All_Sheets_*.xlsx
 *.db
 *.sqlite
 *.sqlite3
+
+# Validation outputs (generated)
+validation_runs/

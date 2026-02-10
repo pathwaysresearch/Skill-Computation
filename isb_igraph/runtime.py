@@ -35,6 +35,13 @@ COMPUTE_PROFILES: dict[str, dict[str, Any]] = {
     },
 }
 
+# Aliases used by UI/API wording.
+COMPUTE_PROFILE_ALIASES: dict[str, str] = {
+    "quick": "fast",
+    "standard": "balanced",
+    "full": "deep",
+}
+
 
 def runtime_root() -> Path:
     return Path(os.getenv("ISB_IGRAPH_RUNTIME_ROOT", "runtime")).resolve()
@@ -98,6 +105,14 @@ def _optional_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _normalize_profile(profile: str) -> str:
+    key = str(profile).strip().lower()
+    key = COMPUTE_PROFILE_ALIASES.get(key, key)
+    if key not in COMPUTE_PROFILES:
+        return "balanced"
+    return key
+
+
 def build_pipeline_config_dict(
     *,
     input_csv: Path,
@@ -105,10 +120,7 @@ def build_pipeline_config_dict(
     options: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     options = options or {}
-    profile = str(options.get("compute_profile", "balanced")).strip().lower()
-    if profile not in COMPUTE_PROFILES:
-        profile = "balanced"
-
+    profile = _normalize_profile(str(options.get("compute_profile", "balanced")))
     profile_defaults = COMPUTE_PROFILES[profile]
 
     config = PipelineConfig(
@@ -117,8 +129,10 @@ def build_pipeline_config_dict(
         chunksize=_int(options.get("chunksize"), 25_000),
         top_k=_int(options.get("top_k"), 20),
         similarity_threshold=_float(options.get("similarity_threshold"), 0.0),
-        similarity_method=str(options.get("similarity_method", "both")),
+        similarity_method=str(options.get("similarity_method", options.get("similarity_mode", "both"))),
         projection_max_skill_degree=_int(options.get("projection_max_skill_degree"), 2_000),
+        projection_max_pairs_per_skill=_int(options.get("projection_max_pairs_per_skill"), 1_500_000),
+        projection_max_total_pairs=_int(options.get("projection_max_total_pairs"), 25_000_000),
         compute_betweenness_enabled=_bool(
             options.get("compute_betweenness_enabled"),
             profile_defaults["compute_betweenness_enabled"],
@@ -146,7 +160,19 @@ def build_pipeline_config_dict(
         subset_mode=_bool(options.get("subset_mode"), False),
         subset_target_rows=_optional_int(options.get("subset_target_rows")),
         subset_target_size_mb=_int(options.get("subset_target_size_mb"), 100),
-        subset_seed=_int(options.get("subset_seed"), 42),
+        subset_seed=_int(options.get("subset_seed", options.get("seed")), 42),
+        compute_profile=profile,
+        similarity_mode=str(options.get("similarity_mode", options.get("similarity_method", "both"))),
+        centrality_enabled=_bool(options.get("centrality_enabled"), True),
+        betweenness_max_nodes=_int(
+            options.get("betweenness_max_nodes"),
+            profile_defaults["compute_betweenness_max_vertices"],
+        ),
+        closeness_max_nodes=_int(
+            options.get("closeness_max_nodes"),
+            profile_defaults["compute_closeness_max_vertices"],
+        ),
+        seed=_int(options.get("seed", options.get("subset_seed")), 42),
     )
 
     payload = asdict(config)
@@ -157,6 +183,7 @@ def build_pipeline_config_dict(
 
 
 def pipeline_config_from_dict(payload: dict[str, Any]) -> PipelineConfig:
+    profile = _normalize_profile(str(payload.get("compute_profile", "balanced")))
     return PipelineConfig(
         input_csv=Path(str(payload["input_csv"])),
         output_dir=Path(str(payload["output_dir"])),
@@ -165,6 +192,8 @@ def pipeline_config_from_dict(payload: dict[str, Any]) -> PipelineConfig:
         similarity_threshold=_float(payload.get("similarity_threshold"), 0.0),
         similarity_method=str(payload.get("similarity_method", "both")),
         projection_max_skill_degree=_int(payload.get("projection_max_skill_degree"), 2_000),
+        projection_max_pairs_per_skill=_int(payload.get("projection_max_pairs_per_skill"), 1_500_000),
+        projection_max_total_pairs=_int(payload.get("projection_max_total_pairs"), 25_000_000),
         compute_betweenness_enabled=_bool(payload.get("compute_betweenness_enabled"), True),
         compute_betweenness_max_vertices=_int(payload.get("compute_betweenness_max_vertices"), 15_000),
         compute_betweenness_max_edges=_int(payload.get("compute_betweenness_max_edges"), 1_000_000),
@@ -175,4 +204,10 @@ def pipeline_config_from_dict(payload: dict[str, Any]) -> PipelineConfig:
         subset_target_rows=_optional_int(payload.get("subset_target_rows")),
         subset_target_size_mb=_int(payload.get("subset_target_size_mb"), 100),
         subset_seed=_int(payload.get("subset_seed"), 42),
+        compute_profile=profile,
+        similarity_mode=str(payload.get("similarity_mode", payload.get("similarity_method", "both"))),
+        centrality_enabled=_bool(payload.get("centrality_enabled"), True),
+        betweenness_max_nodes=_int(payload.get("betweenness_max_nodes"), 15_000),
+        closeness_max_nodes=_int(payload.get("closeness_max_nodes"), 30_000),
+        seed=_int(payload.get("seed", payload.get("subset_seed")), 42),
     )

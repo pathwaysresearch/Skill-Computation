@@ -158,6 +158,8 @@ def run_pipeline_file(
             top_k=config.top_k,
             similarity_threshold=config.similarity_threshold,
             max_skill_degree=config.projection_max_skill_degree,
+            max_pairs_per_skill=config.projection_max_pairs_per_skill,
+            max_total_pairs=config.projection_max_total_pairs,
         )
 
     weighted_for_projection = (

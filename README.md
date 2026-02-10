@@ -1,55 +1,59 @@
-# ISB iGraph MVP
+# ISB iGraph MVP + Async Deployment
 
-End-to-end MVP pipeline to convert large job posting CSV data into an igraph-based Job-Skill bipartite graph, compute Job-Job closeness, and export analysis-ready outputs.
+End-to-end pipeline to convert large jobs CSV/XLSX into igraph structures, compute job closeness, and serve deployment-ready async execution.
 
-## What this MVP does
+## What is implemented
 
-- Ingests large CSV in chunks (encoding-aware)
-- Standardizes varying column names to canonical schema
-- Robustly parses malformed `skills` JSON-like payloads
-- Normalizes skill text + bucket labels deterministically
-- Builds Job-Skill bipartite graph with `python-igraph`
-- Computes bipartite metrics + projected Job-Job metrics
-- Produces top-K nearest jobs using weighted/unweighted overlap
-- Exports mandatory output artifacts
-- Includes deterministic subset builder (~100MB target by default)
-- Includes Streamlit UI for upload, run, metrics, downloads, and lookup
+- Chunked ingestion and robust skill parsing
+- Job-Skill bipartite graph using `python-igraph`
+- Job-Job projection with deterministic similarity
+- Lookup utilities:
+  - Job -> Closest Jobs
+  - Skill(s) -> Closest Jobs (OR)
+  - Job -> Top Skills
+- Streamlit UI tabs:
+  - `Run` (async API jobs)
+  - `Metrics`
+  - `Lookup`
+  - `Visualize`
+- Async stack for large compute:
+  - FastAPI jobs API (`services/api/main.py`)
+  - SQLite job store/queue (`services/api/store.py`)
+  - Worker (`services/worker/main.py`)
+
+## Similarity is deterministic (not random)
+
+- Unweighted similarity: `shared_skill_count`
+- Weighted similarity: `sum(min(edge_weight_a, edge_weight_b))` over shared skills
+
+Default ranking in lookup is unweighted shared-skill count first.
 
 ## Project structure
 
 ```text
-isb-igraph/
-  app.py
-  requirements.txt
-  README.md
-  sample_data/
-    jobs_sample.csv
-  isb_igraph/
-    __init__.py
-    __main__.py
-    cli.py
-    lookup.py
-    skill_lookup.py
-    config.py
-    ingest.py
-    skill_parser.py
-    normalization.py
-    entities.py
-    graph.py
-    projection.py
-    subset.py
-    export.py
-    qa.py
-    pipeline.py
-  tests/
-    test_skill_parser.py
-    test_normalization.py
-    test_entities.py
-    test_subset.py
-    test_qa.py
-    test_pipeline_integration.py
-    test_lookup.py
-    test_skill_lookup.py
+app.py
+requirements.txt
+docker-compose.yml
+Dockerfile
+DEPLOYMENT.md
+services/
+  api/
+    main.py
+    store.py
+  worker/
+    main.py
+isb_igraph/
+  pipeline.py
+  graph.py
+  projection.py
+  lookup.py
+  skill_lookup.py
+  runtime.py
+  jobs_client.py
+tests/
+  test_jobs_api.py
+  test_worker_async.py
+  ...
 ```
 
 ## Install
@@ -60,23 +64,34 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Core Similarity Logic (Deterministic, Not Random)
+## Run (local, async)
 
-Job-to-job closeness is deterministic and based on shared skills.
+Terminal 1:
 
-For each pair of jobs, scores come from the Job-Skill bipartite edges:
+```bash
+uvicorn services.api.main:app --host 0.0.0.0 --port 8000
+```
 
-- `unweighted similarity`:
-  - `shared_skill_count`
-  - Count of shared normalized skills between two jobs
-- `weighted similarity`:
-  - `sum(min(edge_weight_job_a, edge_weight_job_b))` over shared skills
+Terminal 2:
 
-Ranking is descending by score, then deterministic tie-breaks by job IDs.
+```bash
+python -m services.worker.main --poll-interval 2
+```
 
-By default, lookup now uses `unweighted` (shared-skill-count-first behavior).
+Terminal 3:
 
-## Run CLI Pipeline
+```bash
+export ISB_IGRAPH_API_BASE_URL=http://localhost:8000
+streamlit run app.py
+```
+
+## Run with Docker Compose
+
+```bash
+docker compose up --build
+```
+
+## CLI pipeline (direct)
 
 ```bash
 python -m isb_igraph \
@@ -84,9 +99,9 @@ python -m isb_igraph \
   --output-dir output
 ```
 
-## Closest Job Lookup Utility
+## Lookup CLIs
 
-Query `job_similarity_topk.csv` by `job_id` or title:
+Closest jobs:
 
 ```bash
 python -m isb_igraph.lookup \
@@ -97,51 +112,17 @@ python -m isb_igraph.lookup \
   --limit 20
 ```
 
-By title:
-
-```bash
-python -m isb_igraph.lookup \
-  --nodes-csv output/nodes.csv \
-  --similarity-csv output/job_similarity_topk.csv \
-  --title "4 Wheeler Mechanic" \
-  --method weighted \
-  --limit 10
-```
-
-With explainability columns (`shared_skill_count`, `shared_skills_preview`):
-
-```bash
-python -m isb_igraph.lookup \
-  --nodes-csv output/nodes.csv \
-  --similarity-csv output/job_similarity_topk.csv \
-  --edges-csv output/edges.csv \
-  --job-id job_001 \
-  --method unweighted \
-  --limit 20
-```
-
-Notes:
-- If a title matches multiple jobs, the utility prints candidate `job_id` rows and exits for disambiguation.
-- Use `--json` for JSON output.
-
-## Skill-to-Job OR Lookup Utility
-
-### Mode 1: Skill(s) -> Closest Jobs (OR)
+Skill(s) -> jobs OR:
 
 ```bash
 python -m isb_igraph.skill_lookup \
   --nodes-csv output/nodes.csv \
   --edges-csv output/edges.csv \
-  --skills "problem solving, analytical thinking, machine operation" \
+  --skills "problem solving, analytical thinking" \
   --limit 20
 ```
 
-Scoring for this mode:
-- Primary: `matched_skill_count` (how many query skills are matched)
-- Tie-break 1: `matched_weight_sum`
-- Tie-break 2: `job_id` ascending
-
-### Mode 2: Job -> Top Skills
+Job -> top skills:
 
 ```bash
 python -m isb_igraph.skill_lookup \
@@ -151,150 +132,61 @@ python -m isb_igraph.skill_lookup \
   --limit 20
 ```
 
-Or by title:
+## API quick examples
+
+Queue by server path (best for very large files):
 
 ```bash
-python -m isb_igraph.skill_lookup \
-  --nodes-csv output/nodes.csv \
-  --edges-csv output/edges.csv \
-  --title "4 Wheeler Mechanic" \
-  --limit 20
+curl -X POST http://localhost:8000/v1/jobs/from-path \
+  -H "Content-Type: application/json" \
+  -d '{
+    "input_path": "/Users/srijan26/ISB_Work/isb-igraph /Merged_All_Sheets_post6_skill_salary_merged_skills_non_empty_2_from_xlsx.csv",
+    "options": {"compute_profile": "quick", "similarity_method": "both", "top_k": 20}
+  }'
 ```
 
-Skill resolution behavior:
-- Exact normalized match first
-- For unresolved skills, fuzzy suggestions are generated using `rapidfuzz`
-- Use `--fuzzy-cutoff` and `--suggestion-limit` to tune
-
-## CLI options (important)
-
-- `--similarity-method both|weighted|unweighted`
-- `--top-k 20`
-- `--similarity-threshold 0.0`
-- `--subset-mode`
-- `--subset-target-rows 100000`
-- `--subset-target-size-mb 100`
-- `--subset-seed 42`
-- `--projection-max-skill-degree 2000`
-- `--disable-betweenness`
-- `--disable-closeness`
-- `--compute-betweenness-max-vertices` and `--compute-betweenness-max-edges`
-- `--compute-closeness-max-vertices` and `--compute-closeness-max-edges`
-
-## Run Streamlit UI
+Get status:
 
 ```bash
-streamlit run app.py
+curl http://localhost:8000/v1/jobs/<job_id>
 ```
 
-UI supports:
-- Pipeline tab:
-  - CSV upload
-  - weighted/unweighted/both mode
-  - top-k and threshold
-  - computation profiles: fast, balanced, deep
-  - advanced centrality guards (betweenness/closeness enable/disable + size thresholds)
-  - subset mode and sample sizing
-  - live progress and metrics
-  - per-file download buttons
-- Subgraph Visualizer tab:
-  - ego graph around a selected job (by ID/title filter)
-  - top connected component rendering
-  - global overview mode (node-type counts, degree distribution, component sizes)
-  - global sampled rendering and safe full-render attempt
-  - one-click visualization diagnostics
-  - node/edge render caps to keep UI responsive
-- Lookup tab:
-  - Job -> Closest Jobs (default unweighted, optional weighted/all)
-  - Skill(s) -> Closest Jobs OR
-  - Job -> Top Skills
+## Outputs
 
-## Graph Visualization (MVP)
-
-- Current MVP visualization is Streamlit + Altair for filtered subgraphs.
-- For large graphs (hundreds of thousands of nodes/edges), rendering the entire graph interactively on a laptop is usually not practical.
-- Recommended approach is visualizing filtered views:
-  - subset-mode graph (`sample_nodes.csv`, `sample_edges.csv`)
-  - ego networks around one job and its nearest neighbors
-  - top connected components/high-degree skill neighborhoods
-
-## Output files
-
-### Core outputs
-
-- `nodes.csv` columns:
-  - `node_id, node_type(job|skill), label, attributes_json`
-- `edges.csv` columns:
-  - `source, target, relation, weight, attributes_json`
-- `job_similarity_topk.csv` columns:
-  - `job_id, neighbor_job_id, similarity_score, rank, method`
+Mandatory outputs:
+- `nodes.csv`
+- `edges.csv`
+- `job_similarity_topk.csv`
 - `graph_summary.json`
 - `parse_errors.csv`
 
-### Additional metrics/QA outputs
-
+Additional:
 - `job_node_metrics.csv`
 - `skill_node_metrics.csv`
 - `projected_job_metrics.csv`
-- `profiling_summary.csv`
 - `validation_report.json`
 - `qa_report.json`
+- `profiling_summary.csv`
 
-### Subset mode outputs
+## Scaling notes beyond MVP
 
-- `sample_input.csv`
-- `sample_nodes.csv`
-- `sample_edges.csv`
-- `sample_job_similarity_topk.csv`
-- `sample_graph_summary.json`
-- `sample_summary.json`
+- Keep Streamlit as orchestration/inspection UI only.
+- Scale workers horizontally (separate queue backend later if needed).
+- Move artifacts to object storage and replace local paths with signed URLs.
+- Keep deterministic subset + full validation gates for each new data drop.
 
-## Deterministic normalization and weighting
-
-- Skill normalization:
-  - lowercase
-  - trim + collapse whitespace
-  - strip trailing punctuation
-- Bucket normalization map:
-  - Mission-Critical / mission critical / critical -> 4
-  - Advanced / 4: Advanced -> 3
-  - Proficient / 3: Proficient -> 2
-  - Working Knowledge -> 1
-  - Familiarity / 1: Familiarity -> 0
-- Edge weight:
-  - `0.7 * mapping_similarity_clipped_0_1 + 0.3 * (bucket_score / 4)`
-  - fallback if similarity missing:
-    - `0.5 * (bucket_score / 4) + 0.5 * default_similarity(0.5)`
-
-## Quick output preview (sample)
-
-Example `job_similarity_topk.csv` rows:
-
-```text
-job_id,neighbor_job_id,similarity_score,rank,method
-job_001,job_002,1.0,1,unweighted
-job_001,job_006,0.92,1,weighted
-```
-
-## Tests
+## Run tests
 
 ```bash
-pytest -q
+python -m pytest -q
 ```
 
-Covers:
-- parser robustness
-- bucket normalization
-- dedup behavior
-- edge weight computation
-- QA checks
-- subset reproducibility
-- lookup determinism and ranking behavior
-- end-to-end pipeline smoke test
+## Projection guard knobs
 
-## Scaling beyond MVP
+For very large datasets, use:
 
-- Add optional Parquet intermediate storage to reduce CSV overhead.
-- Add ANN indexing on projected Job-Job edges for low-latency lookup at very large scale.
-- Add approximate similarity mode (e.g., MinHash/LSH) for very high-degree skill expansion.
-- Move heavy centrality jobs to offline batch with configurable scheduling.
+- `--projection-max-skill-degree`
+- `--projection-max-pairs-per-skill`
+- `--projection-max-total-pairs`
+
+These prevent pair explosion in Job-Job projection while keeping deterministic behavior.
