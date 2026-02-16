@@ -337,26 +337,16 @@ def subgraph_to_plot_data(
         }
 
     sub = graph.induced_subgraph(node_ids)
+    global_degree_by_name = {
+        graph.vs[vid]["name"]: int(deg)
+        for vid, deg in zip(node_ids, graph.degree(node_ids))
+    }
 
     if sub.vcount() == 1:
         layout_points = [(0.0, 0.0)]
     else:
         layout = sub.layout_fruchterman_reingold(weights=sub.es["weight"] if sub.ecount() else None, niter=300)
         layout_points = [tuple(point) for point in layout]
-
-    node_rows: list[dict[str, Any]] = []
-    for idx, vertex in enumerate(sub.vs):
-        x, y = layout_points[idx]
-        node_rows.append(
-            {
-                "node_id": vertex["name"],
-                "label": vertex["label"],
-                "node_type": vertex["node_type"],
-                "x": float(x),
-                "y": float(y),
-                "degree": int(sub.degree(idx)),
-            }
-        )
 
     edge_rows: list[dict[str, Any]] = []
     for edge in sub.es:
@@ -374,6 +364,32 @@ def subgraph_to_plot_data(
     if len(edge_rows) > max_edges:
         edge_rows = sorted(edge_rows, key=lambda x: x["weight"], reverse=True)[:max_edges]
         clipped = len(sub.es) - max_edges
+
+    rendered_degree: dict[str, int] = {}
+    for row in edge_rows:
+        src = str(row["source"])
+        tgt = str(row["target"])
+        rendered_degree[src] = rendered_degree.get(src, 0) + 1
+        rendered_degree[tgt] = rendered_degree.get(tgt, 0) + 1
+
+    node_rows: list[dict[str, Any]] = []
+    for idx, vertex in enumerate(sub.vs):
+        x, y = layout_points[idx]
+        name = str(vertex["name"])
+        local_degree = int(sub.degree(idx))
+        node_rows.append(
+            {
+                "node_id": name,
+                "label": vertex["label"],
+                "node_type": vertex["node_type"],
+                "x": float(x),
+                "y": float(y),
+                "degree_global": int(global_degree_by_name.get(name, 0)),
+                "degree_local": local_degree,
+                "degree_rendered": int(rendered_degree.get(name, 0)),
+                "degree": int(global_degree_by_name.get(name, local_degree)),
+            }
+        )
 
     return {
         "nodes": pd.DataFrame(node_rows),

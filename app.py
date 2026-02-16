@@ -52,7 +52,7 @@ from isb_igraph.visualization import (
 assert_runtime_compatibility()
 
 st.set_page_config(page_title="ISB iGraph Deployment UI", layout="wide")
-st.title("ISB iGraph Deployment UI")
+st.title(" iGraph UI")
 st.caption("Async jobs API + worker for large-file graph computation, lookup, and visualization")
 
 COMPUTE_PRESETS: dict[str, dict[str, Any]] = {
@@ -151,12 +151,14 @@ def _render_subgraph_chart(plot_data: dict[str, Any]) -> None:
             x=alt.X("x:Q", axis=None),
             y=alt.Y("y:Q", axis=None),
             color=alt.Color("node_type:N", legend=alt.Legend(title="Node Type")),
-            size=alt.Size("degree:Q", legend=alt.Legend(title="Degree")),
+            size=alt.Size("degree_global:Q", legend=alt.Legend(title="Global Degree")),
             tooltip=[
                 alt.Tooltip("node_id:N", title="Node ID"),
                 alt.Tooltip("label:N", title="Label"),
                 alt.Tooltip("node_type:N", title="Type"),
-                alt.Tooltip("degree:Q", title="Degree"),
+                alt.Tooltip("degree_global:Q", title="Global Degree"),
+                alt.Tooltip("degree_local:Q", title="Local Degree (Subgraph)"),
+                alt.Tooltip("degree_rendered:Q", title="Rendered Degree (After Edge Cap)"),
             ],
         )
         .properties(height=620)
@@ -186,6 +188,7 @@ def _render_subgraph_chart(plot_data: dict[str, Any]) -> None:
 
     if clipped_edges > 0:
         st.info(f"Rendered top-weighted edges only. Clipped edges: {clipped_edges}")
+        st.caption("Rendered degree can be lower than local/global degree when edge cap is active.")
 
 
 def _render_global_overview(
@@ -710,7 +713,7 @@ def _visualize_tab() -> None:
     max_nodes = st.slider("Max nodes in rendered subgraph", min_value=20, max_value=5000, value=300, step=10)
     max_edges = st.slider("Max edges in rendered subgraph", min_value=50, max_value=15000, value=1500, step=50)
 
-    mode = st.radio("Visualization mode", ["Ego graph", "Top connected component", "Global overview"], horizontal=True)
+    mode = st.radio("Visualization mode", ["Ego graph", "Skill hub", "Top connected component", "Global overview"], horizontal=True)
 
     if mode == "Ego graph":
         c1, c2 = st.columns(2)
@@ -737,6 +740,59 @@ def _visualize_tab() -> None:
         sub_nodes = bfs_ego_nodes(graph, center_idx, max_hops=int(hops), max_nodes=int(max_nodes))
         plot_data = subgraph_to_plot_data(graph, sub_nodes, max_edges=int(max_edges))
         _render_subgraph_chart(plot_data)
+
+    elif mode == "Skill hub":
+        skill_nodes = nodes_df[nodes_df["node_type"].astype(str) == "skill"][["node_id", "label"]].copy()
+        if skill_nodes.empty:
+            st.warning("No skill nodes found.")
+            return
+
+        skill_query = st.text_input("Skill label filter", key="viz_skill_filter")
+        if skill_query.strip():
+            q = skill_query.strip().lower()
+            skill_nodes = skill_nodes[skill_nodes["label"].astype(str).str.lower().str.contains(q, na=False)].copy()
+
+        if skill_nodes.empty:
+            st.warning("No skill matches the current filter.")
+            return
+
+        degree_map = dict(zip(graph.vs["name"], graph.degree()))
+        skill_nodes["global_degree"] = (
+            skill_nodes["node_id"].astype(str).map(degree_map).fillna(0).astype(int)
+        )
+        skill_nodes = skill_nodes.sort_values(
+            by=["global_degree", "label", "node_id"],
+            ascending=[False, True, True],
+            kind="stable",
+        ).head(300)
+
+        options = [
+            f"{row.node_id} | {row.label} | degree={row.global_degree}"
+            for row in skill_nodes.itertuples(index=False)
+        ]
+        selected = st.selectbox("Center skill", options)
+        selected_skill_id = selected.split(" | ", 1)[0]
+
+        hops = st.slider("Skill neighborhood hops", min_value=1, max_value=3, value=1)
+
+        center_idx = export_graph.node_index.get(selected_skill_id)
+        if center_idx is None:
+            st.error("Selected skill not found in graph index")
+            return
+
+        sub_nodes = bfs_ego_nodes(graph, center_idx, max_hops=int(hops), max_nodes=int(max_nodes))
+        plot_data = subgraph_to_plot_data(graph, sub_nodes, max_edges=int(max_edges))
+        _render_subgraph_chart(plot_data)
+
+        linked_jobs = edges_df[edges_df["target"].astype(str) == str(selected_skill_id)][["source"]].copy()
+        linked_jobs = linked_jobs.rename(columns={"source": "job_id"}).drop_duplicates(subset=["job_id"])
+        job_labels = nodes_df[nodes_df["node_type"].astype(str) == "job"][["node_id", "label"]].rename(
+            columns={"node_id": "job_id", "label": "job_title"}
+        )
+        linked_jobs = linked_jobs.merge(job_labels, on="job_id", how="left")
+        st.markdown("### Jobs requiring selected skill")
+        st.caption(f"Total linked jobs: {len(linked_jobs):,}")
+        st.dataframe(linked_jobs.head(200), use_container_width=True, hide_index=True)
 
     elif mode == "Top connected component":
         comps = top_components(graph, limit=50)
