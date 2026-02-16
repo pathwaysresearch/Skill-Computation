@@ -53,6 +53,38 @@ def _xlsx_to_csv(xlsx_path: Path, csv_path: Path) -> Path:
     return csv_path
 
 
+def _parse_gcs_uri(gcs_uri: str) -> tuple[str, str]:
+    if not gcs_uri.startswith("gs://"):
+        raise ValueError(f"Invalid GCS URI: {gcs_uri}")
+    remainder = gcs_uri[len("gs://") :]
+    bucket, sep, blob = remainder.partition("/")
+    if not bucket or not sep or not blob:
+        raise ValueError(f"Invalid GCS URI: {gcs_uri}")
+    return bucket, blob
+
+
+def _download_gcs_to_local(gcs_uri: str, output_dir: Path) -> Path:
+    try:
+        from google.cloud import storage  # type: ignore
+    except Exception as exc:
+        raise RuntimeError("google-cloud-storage is required for gs:// inputs") from exc
+
+    bucket_name, blob_name = _parse_gcs_uri(gcs_uri)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    blob_file_name = Path(blob_name).name or "input_from_gcs.csv"
+    local_path = output_dir / blob_file_name
+
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.download_to_filename(str(local_path))
+
+    if not local_path.exists() or not local_path.is_file():
+        raise FileNotFoundError(f"Downloaded file missing after GCS fetch: {local_path}")
+    return local_path
+
+
 def _collect_artifacts(output_files: dict[str, Path]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for artifact_name, file_path in output_files.items():
@@ -82,13 +114,20 @@ def _run_one_job(store: JobStore, job: JobRecord) -> None:
     output_dir = Path(job.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    input_path = Path(job.input_path)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Input file not found: {input_path}")
+    input_ref = str(job.input_path)
+
+    if input_ref.startswith("gs://"):
+        store.add_event(job.job_id, level="info", message=f"Downloading input from GCS: {input_ref}", progress=0.01)
+        input_path = _download_gcs_to_local(input_ref, output_dir / "input_from_gcs")
+        store.add_event(job.job_id, level="info", message=f"Downloaded GCS input to {input_path}", progress=0.02)
+    else:
+        input_path = Path(input_ref)
+        if not input_path.exists():
+            raise FileNotFoundError(f"Input file not found: {input_path}")
 
     resolved_input = input_path
     if input_path.suffix.lower() == ".xlsx":
-        store.add_event(job.job_id, level="info", message="Converting XLSX to CSV", progress=0.01)
+        store.add_event(job.job_id, level="info", message="Converting XLSX to CSV", progress=0.03)
         converted_path = output_dir / "input_from_xlsx.csv"
         resolved_input = _xlsx_to_csv(input_path, converted_path)
 

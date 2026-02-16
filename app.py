@@ -17,6 +17,7 @@ from isb_igraph.jobs_client import (
     default_api_base_url,
     get_job,
     get_job_events,
+    submit_job_from_gcs,
     submit_job_from_path,
     upload_and_submit_job,
 )
@@ -398,12 +399,11 @@ def _render_sidebar() -> tuple[str, dict[str, Any]]:
     }
     return api_base_url, options
 
-
 def _run_tab(api_base_url: str, options: dict[str, Any]) -> None:
     st.subheader("Run (Async Jobs)")
     st.caption("Submit jobs to API/worker. Streamlit does not run heavy compute in-process.")
 
-    mode = st.radio("Input mode", ["Server file path", "Upload file"], horizontal=True)
+    mode = st.radio("Input mode", ["Server file path", "GCS URI", "Upload file"], horizontal=True)
     submit_col1, submit_col2 = st.columns(2)
 
     with submit_col1:
@@ -425,9 +425,29 @@ def _run_tab(api_base_url: str, options: dict[str, Any]) -> None:
                     st.session_state["latest_job_id"] = payload.get("job_id")
                     st.session_state["latest_job_payload"] = payload
                     st.success(f"Submitted job: {payload.get('job_id')}")
+        elif mode == "GCS URI":
+            st.info("Recommended for Cloud Run large files. Example: gs://my-bucket/path/jobs.csv")
+            gcs_uri = st.text_input("GCS URI", value="gs://my-bucket/path/to/jobs.csv")
+            if st.button("Submit GCS job", type="primary"):
+                if not gcs_uri.strip():
+                    st.error("Enter a gs:// URI")
+                else:
+                    try:
+                        payload = submit_job_from_gcs(
+                            gcs_uri=gcs_uri.strip(),
+                            options=options,
+                            base_url=api_base_url,
+                        )
+                    except Exception as exc:
+                        st.error(f"Failed to submit GCS job: {exc}")
+                    else:
+                        st.session_state["latest_job_id"] = payload.get("job_id")
+                        st.session_state["latest_job_payload"] = payload
+                        st.success(f"Submitted job: {payload.get('job_id')}")
         else:
-            uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"]) 
+            uploaded = st.file_uploader("Upload CSV/XLSX", type=["csv", "xlsx"])
             part_size_mb = st.number_input("Upload chunk size MB", min_value=2, max_value=128, value=8, step=2)
+            st.caption("For Cloud Run, use GCS URI mode for large files to avoid HTTP 413 limits.")
             if st.button("Upload + submit job", type="primary"):
                 if uploaded is None:
                     st.error("Upload a file first.")
@@ -470,45 +490,23 @@ def _run_tab(api_base_url: str, options: dict[str, Any]) -> None:
                 st.session_state["latest_job_events"] = events_payload.get("events", [])
             except Exception as exc:
                 st.error(f"Failed to fetch events: {exc}")
-        if c3.button("Cancel job") and job_id.strip():
+        if c3.button("Cancel") and job_id.strip():
             try:
                 _ = cancel_job(job_id.strip(), base_url=api_base_url)
-                st.warning("Cancel requested.")
+                st.warning(f"Cancellation requested for {job_id}")
             except Exception as exc:
                 st.error(f"Failed to cancel job: {exc}")
 
-    latest_job = st.session_state.get("latest_job_payload")
-    if latest_job:
+    payload = st.session_state.get("latest_job_payload")
+    if payload:
         st.markdown("### Latest Job")
-        status = str(latest_job.get("status", "unknown"))
-        progress = float(latest_job.get("progress", 0.0) or 0.0)
-        st.progress(max(0.0, min(1.0, progress)))
-        st.write({
-            "job_id": latest_job.get("job_id"),
-            "status": status,
-            "stage": latest_job.get("stage"),
-            "progress": progress,
-            "error_message": latest_job.get("error_message"),
-            "output_dir": latest_job.get("output_dir"),
-        })
+        st.json(payload)
 
-        artifacts = latest_job.get("artifacts") or []
-        if artifacts:
-            st.markdown("### Artifacts")
-            for a in artifacts:
-                file_path = Path(str(a.get("file_path", "")))
-                if file_path.exists() and file_path.is_file():
-                    st.download_button(
-                        label=f"Download {a.get('artifact_name')} ({file_path.name})",
-                        data=file_path.read_bytes(),
-                        file_name=file_path.name,
-                        key=f"artifact_dl_{latest_job.get('job_id')}_{a.get('artifact_name')}",
-                    )
-
-    events = st.session_state.get("latest_job_events") or []
+    events = st.session_state.get("latest_job_events")
     if events:
         st.markdown("### Recent Events")
-        st.dataframe(pd.DataFrame(events), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(events), use_container_width=True)
+
 
 
 def _metrics_tab() -> None:

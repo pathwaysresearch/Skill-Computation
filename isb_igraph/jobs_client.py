@@ -47,6 +47,20 @@ def submit_job_from_path(
     )
 
 
+def submit_job_from_gcs(
+    *,
+    gcs_uri: str,
+    options: dict[str, Any],
+    base_url: str | None = None,
+) -> dict[str, Any]:
+    base = (base_url or default_api_base_url()).rstrip("/")
+    return _request_json(
+        "POST",
+        f"{base}/v1/jobs/from-gcs",
+        json={"gcs_uri": str(gcs_uri), "options": options},
+    )
+
+
 def upload_and_submit_job(
     *,
     file_path: Path,

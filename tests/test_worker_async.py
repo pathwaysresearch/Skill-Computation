@@ -4,7 +4,13 @@ from pathlib import Path
 
 from isb_igraph.runtime import artifacts_root, jobs_db_path
 from services.api.store import JobStore
-from services.worker.main import run_worker
+from services.worker.main import _parse_gcs_uri, run_worker
+
+
+def test_parse_gcs_uri() -> None:
+    bucket, blob = _parse_gcs_uri("gs://demo-bucket/folder/input.csv")
+    assert bucket == "demo-bucket"
+    assert blob == "folder/input.csv"
 
 
 def test_worker_processes_queued_job(tmp_path: Path, monkeypatch) -> None:

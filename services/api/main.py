@@ -22,7 +22,7 @@ from .store import (
 )
 
 
-app = FastAPI(title="ISB iGraph Jobs API", version="1.0.0")
+app = FastAPI(title="ISB iGraph Jobs API", version="1.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -61,6 +61,11 @@ class CreateJobFromPathRequest(BaseModel):
     options: dict[str, Any] = Field(default_factory=dict)
 
 
+class CreateJobFromGCSRequest(BaseModel):
+    gcs_uri: str
+    options: dict[str, Any] = Field(default_factory=dict)
+
+
 class CancelJobResponse(BaseModel):
     job_id: str
     status: str
@@ -72,6 +77,7 @@ def _get_store() -> JobStore:
         ensure_runtime_dirs()
         store = JobStore(jobs_db_path())
     return store
+
 
 @app.on_event("startup")
 def startup_event() -> None:
@@ -94,6 +100,26 @@ def _json_loads_safe(value: str | None) -> dict[str, Any] | None:
         return json.loads(value)
     except Exception:
         return None
+
+
+def _validate_supported_input_name(name: str) -> None:
+    suffix = Path(name).suffix.lower()
+    if suffix not in {".csv", ".xlsx"}:
+        raise HTTPException(status_code=400, detail="Only CSV/XLSX files are supported")
+
+
+def _validate_gcs_uri(gcs_uri: str) -> str:
+    uri = gcs_uri.strip()
+    if not uri.startswith("gs://"):
+        raise HTTPException(status_code=400, detail="gcs_uri must start with gs://")
+    if len(uri) <= len("gs://"):
+        raise HTTPException(status_code=400, detail="gcs_uri is empty")
+    remainder = uri[len("gs://") :]
+    bucket, sep, blob = remainder.partition("/")
+    if not bucket or not sep or not blob:
+        raise HTTPException(status_code=400, detail="gcs_uri must be in format gs://bucket/path/file.csv")
+    _validate_supported_input_name(blob)
+    return uri
 
 
 def _job_payload(job_id: str) -> dict[str, Any]:
@@ -273,9 +299,7 @@ def create_job_from_path(payload: CreateJobFromPathRequest) -> dict[str, Any]:
     if not input_path.exists() or not input_path.is_file():
         raise HTTPException(status_code=400, detail=f"input_path not found: {input_path}")
 
-    suffix = input_path.suffix.lower()
-    if suffix not in {".csv", ".xlsx"}:
-        raise HTTPException(status_code=400, detail="Only CSV/XLSX files are supported")
+    _validate_supported_input_name(input_path.name)
 
     job_id = str(uuid.uuid4())
     output_dir = artifacts_root() / job_id
@@ -287,6 +311,25 @@ def create_job_from_path(payload: CreateJobFromPathRequest) -> dict[str, Any]:
         output_dir=output_dir,
         options=payload.options,
     )
+
+    return _job_payload(job_id)
+
+
+@app.post("/v1/jobs/from-gcs")
+def create_job_from_gcs(payload: CreateJobFromGCSRequest) -> dict[str, Any]:
+    gcs_uri = _validate_gcs_uri(payload.gcs_uri)
+
+    job_id = str(uuid.uuid4())
+    output_dir = artifacts_root() / job_id
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    _get_store().create_job(
+        job_id=job_id,
+        input_path=gcs_uri,
+        output_dir=output_dir,
+        options=payload.options,
+    )
+    _get_store().add_event(job_id, level="info", message=f"Registered GCS input: {gcs_uri}", progress=0.0)
 
     return _job_payload(job_id)
 

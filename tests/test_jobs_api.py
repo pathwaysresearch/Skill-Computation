@@ -82,6 +82,25 @@ def test_create_job_from_path_not_found(tmp_path: Path, monkeypatch) -> None:
     assert resp.status_code == 400
 
 
+def test_create_job_from_gcs_validation_and_queue(tmp_path: Path, monkeypatch) -> None:
+    client, _ = _build_client(tmp_path, monkeypatch)
+
+    bad = client.post(
+        "/v1/jobs/from-gcs",
+        json={"gcs_uri": "https://bucket/file.csv", "options": {}},
+    )
+    assert bad.status_code == 400
+
+    good = client.post(
+        "/v1/jobs/from-gcs",
+        json={"gcs_uri": "gs://demo-bucket/path/jobs.csv", "options": {"compute_profile": "quick"}},
+    )
+    assert good.status_code == 200
+    payload = good.json()
+    assert payload["status"] == "queued"
+    assert payload["input_path"] == "gs://demo-bucket/path/jobs.csv"
+
+
 def test_upload_checksum_mismatch(tmp_path: Path, monkeypatch) -> None:
     client, _ = _build_client(tmp_path, monkeypatch)
 

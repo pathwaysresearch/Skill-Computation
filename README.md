@@ -134,13 +134,24 @@ python -m isb_igraph.skill_lookup \
 
 ## API quick examples
 
-Queue by server path (best for very large files):
+Queue by server path (best for local/VM files):
 
 ```bash
 curl -X POST http://localhost:8000/v1/jobs/from-path \
   -H "Content-Type: application/json" \
   -d '{
-    "input_path": "/Users/srijan26/ISB_Work/isb-igraph /Merged_All_Sheets_post6_skill_salary_merged_skills_non_empty_2_from_xlsx.csv",
+    "input_path": "/data/jobs.csv",
+    "options": {"compute_profile": "quick", "similarity_method": "both", "top_k": 20}
+  }'
+```
+
+Queue by GCS URI (best for Cloud Run, avoids upload 413):
+
+```bash
+curl -X POST http://localhost:8000/v1/jobs/from-gcs \
+  -H "Content-Type: application/json" \
+  -d '{
+    "gcs_uri": "gs://my-bucket/path/jobs.csv",
     "options": {"compute_profile": "quick", "similarity_method": "both", "top_k": 20}
   }'
 ```

@@ -178,7 +178,7 @@ class JobStore:
     def create_job(
         self,
         *,
-        input_path: Path,
+        input_path: Path | str,
         output_dir: Path,
         options: dict[str, Any],
         upload_id: str | None = None,
