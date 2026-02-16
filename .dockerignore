@@ -1,0 +1,33 @@
+# VCS
+.git
+.gitignore
+
+# Python caches / env
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+
+# OS/editor
+.DS_Store
+.vscode
+.idea
+
+# Runtime and generated outputs
+runtime
+validation_runs
+output
+output_*
+
+# Local heavy source files
+Merged_All_Sheets_*.csv
+Merged_All_Sheets_*.xlsx
+
+# Local DB / logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Keep build context lean
+sample_data
